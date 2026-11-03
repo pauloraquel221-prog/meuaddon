@@ -1,6 +1,10 @@
 {
   "name": "iracemaflix",
+<<<<<<< HEAD
   "version": "1.4.0",
+=======
+  "version": "1.1.1",
+>>>>>>> origin/main
   "description": "não hospedamos nada, tudo esta na internet para qualquer um poder usar, apenas indexamos",
   "main": "server.js",
   "scripts": {
@@ -11,6 +15,10 @@
     "node": ">=20"
   },
   "dependencies": {
+<<<<<<< HEAD
+=======
+    "dotenv": "^17.0.0",
+>>>>>>> origin/main
     "express": "^4.21.2",
     "stremio-addon-sdk": "^1.6.10",
     "undici": "^6.21.1",
