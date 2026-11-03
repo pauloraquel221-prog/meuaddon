@@ -1,7 +1,7 @@
 {
   "name": "iracemaflix",
   "version": "1.4.0",
-  "description": "Não hospedamos nada, apenas indexamos conteúdos disponíveis na internet.",
+  "description": "não hospedamos nada, tudo esta na internet para qualquer um poder usar, apenas indexamos",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,6 @@
     "node": ">=20"
   },
   "dependencies": {
-    "dotenv": "^17.0.0",
     "express": "^4.21.2",
     "stremio-addon-sdk": "^1.6.10",
     "undici": "^6.21.1",
