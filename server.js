@@ -6195,21 +6195,30 @@ builder.defineStreamHandler(
       return { streams };
     }
 
-    if (type === 'tv') {
-      const entry =
-        await findEntry(id);
-      const xtreamEntries = entry
-        ? await findXtreamEntriesByTitle('tv', entry.title)
-        : [];
-      const selectedXtreamEntries = filterEntriesToSelectedQuality(xtreamEntries, entry);
-      const related = entry
-        ? filterEntriesToSelectedQuality(await findRelatedEntries('tv', entry), entry)
-        : [];
-
-      return {
-        streams: entry ? streamsForEntries(selectedXtreamEntries.length ? selectedXtreamEntries : related) : []
-      };
-    }
+      if (type === 'tv') {
+        const entry =
+          await findEntry(id);
+        if (!entry) return { streams: [] };
+        const [xtreamEntries, relatedEntries] = await Promise.all([
+          findXtreamEntriesByTitle('tv', entry.title).catch(() => []),
+          findRelatedEntries('tv', entry).catch(() => [])
+        ]);
+        const sameQuality = filterEntriesToSelectedQuality([...xtreamEntries, ...relatedEntries], entry);
+        const otherVariants = [...xtreamEntries, ...relatedEntries].filter(
+          (candidate) => !sameQuality.includes(candidate)
+        );
+        const orderedEntries = [entry, ...sameQuality, ...otherVariants];
+        const streams = streamsForEntries(orderedEntries);
+        const uniqueStreams = [];
+        const seenUrls = new Set();
+        for (const stream of streams) {
+          const key = String(stream?.url || '').trim();
+          if (!key || seenUrls.has(key)) continue;
+          seenUrls.add(key);
+          uniqueStreams.push(stream);
+        }
+        return { streams: uniqueStreams };
+      }
 
     const match =
       id.match(
