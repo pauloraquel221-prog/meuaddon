@@ -5876,30 +5876,340 @@ builder.defineMetaHandler(
     }
 
     if (type === 'tv') {
-        const entry =
-          await findEntry(id);
-        if (!entry) return { streams: [] };
-        const [xtreamEntries, relatedEntries] = await Promise.all([
-          findXtreamEntriesByTitle('tv', entry.title).catch(() => []),
-          findRelatedEntries('tv', entry).catch(() => [])
-        ]);
-        const sameQuality = filterEntriesToSelectedQuality([...xtreamEntries, ...relatedEntries], entry);
-        const otherVariants = [...xtreamEntries, ...relatedEntries].filter(
-          (candidate) => !sameQuality.includes(candidate)
-        );
-        const orderedEntries = [entry, ...sameQuality, ...otherVariants];
-        const streams = streamsForEntries(orderedEntries);
-        const uniqueStreams = [];
-        const seenUrls = new Set();
-        for (const stream of streams) {
-          const key = String(stream?.url || '').trim();
-          if (!key || seenUrls.has(key)) continue;
-          seenUrls.add(key);
-          uniqueStreams.push(stream);
-        }
+      const entry =
+        await findEntry(id);
 
-        return { streams: uniqueStreams };
+      return {
+        meta:
+          entry
+            ? await enrichMeta(entry, tvMeta(entry))
+            : undefined
+      };
+    }
+
+    const series =
+      await loadSeries(id);
+
+    return {
+      meta:
+        series
+          ? await enrichMeta(
+              {
+                type: 'series',
+                title: series.title,
+                originalTitle: series.title
+              },
+              seriesMeta(series)
+            )
+          : undefined
+    };
+  }
+);
+
+builder.defineStreamHandler(
+  async ({ type, id }) => {
+    if (String(id).startsWith(LiveTv.CHANNEL_PREFIX) || String(id).startsWith(LiveTv.EVENT_PREFIX) || String(id).startsWith(LiveTv.EMBEDTV_CHANNEL_PREFIX) || String(id).startsWith(LiveTv.EMBEDTV_EVENT_PREFIX)) {
+      return LiveTv.streams(type, id);
+    }
+    const rawId = String(id || '').trim();
+    const imdbId = rawId.match(/(tt\d+)(?::(\d+):(\d+))?/i);
+    if (imdbId) id = `${imdbId[1]}${imdbId[2] ? `:${imdbId[2]}:${imdbId[3]}` : ''}`;
+    if (type === 'tv') {
+      await withTimeout(
+        ensureEpg().catch((error) => console.warn(`[EPG] Stream sem programação: ${error.message}`)),
+        CHANNEL_EPG_TIMEOUT_MS,
+        null
+      );
+    }
+    const movieMatch = String(id).match(/^xtream-movie-(\d+)$/);
+    if (XTREAM_ENABLED && movieMatch) {
+      const movieId = movieMatch[1];
+      const item = await xtreamMovieInfo(movieId);
+      const xtreamItem = xtreamEntry(
+        { ...item, stream_id: movieId },
+        'movie',
+        item.container_extension || 'mp4'
+      );
+      const directPromise = directMovieStreamsForTitle(item.name);
+      let m3uItems = [];
+      try {
+        await ensurePlaylist();
+        m3uItems = await findRelatedEntriesByTitle('movie', item.name);
+      } catch (error) {
+        console.warn(`[STREAM] M3U indisponível para filme: ${error.message}`);
       }
+      const direct = await directPromise;
+      const primary = combineStreams(direct.streams, streamsForEntries([xtreamItem]));
+      return { streams: primary.length ? primary : streamsForEntries(m3uItems) };
+    }
+    const tvMatch = parseXtreamTvId(id);
+    if (XTREAM_ENABLED && tvMatch) {
+      const source = findXtreamTvSource(tvMatch.sourceSlug);
+      if (!source) return { streams: [] };
+      const tvId = tvMatch.streamId;
+      const cacheKey = xtreamTvCacheKey(source, tvId);
+      let selected = xtreamTvCache.get(cacheKey) || (source.id === 'primary'
+        ? xtreamLiveItems.find((item) => String(item.stream_id) === tvId)
+        : undefined);
+      if (!selected) {
+        try {
+          const timeoutMs = Math.min(source.xtreamTimeoutMs || CHANNEL_XTREAM_TIMEOUT_MS, 15000);
+          const live = await xtreamTvRequest(source, 'get_live_streams', timeoutMs);
+          const found = Array.isArray(live) ? live.find((item) => String(item.stream_id) === tvId) : undefined;
+          selected = found ? { ...found, xtreamSource: source } : undefined;
+          if (selected) xtreamTvCache.set(cacheKey, selected);
+        } catch (error) {
+          console.warn(`[STREAM] Canal Xtream indisponível (${source.id}): ${error.message}`);
+        }
+      }
+      let providerItems = [];
+      if (selected) {
+        providerItems = await withTimeout(
+          findXtreamEntriesByTitle('tv', selected.name).catch(() => []),
+          10_000,
+          []
+        );
+      }
+      const xtreamItems = filterEntriesToSelectedQuality(
+        providerItems.length
+          ? providerItems
+          : selected
+            ? [xtreamEntry(
+                { ...selected, xtreamSource: source, container_extension: selected.container_extension || 'ts' },
+                'live'
+              )]
+            : [],
+        selected
+      );
+      let m3uItems = [];
+      if (!xtreamItems.length && selected) {
+        try {
+          const exactM3u = await withTimeout(
+            ensurePlaylist().then(() => findRelatedEntriesByTitle('tv', selected.name)),
+            CHANNEL_M3U_TIMEOUT_MS,
+            []
+          );
+          if (Array.isArray(exactM3u)) m3uItems = filterEntriesToSelectedQuality(exactM3u, selected);
+        } catch (error) {
+          console.warn(`[STREAM] M3U indisponível para canal: ${error.message}`);
+        }
+      }
+      const streams = streamsForEntries(xtreamItems.length ? xtreamItems : m3uItems);
+      sourceLog('stream-result', { source: 'xtream-click-fanout', type: 'tv', id, count: streams.length, providers: new Set(xtreamItems.map((item) => item.sourceName)).size, matchedName: selected?.name });
+      return { streams };
+    }
+    const episodeMatch = String(id).match(/^xtream-episode-(\d+)-(\d+)-(\d+)$/);
+    if (XTREAM_ENABLED && episodeMatch) {
+      const [, seriesIdValue, seasonValue, episodeValue] = episodeMatch;
+      const item = await xtreamSeriesInfo(seriesIdValue);
+      const episode = Object.values(item.episodes || {}).flat().find((x) => Number(x.season) === Number(seasonValue) && Number(x.episode_num) === Number(episodeValue));
+      if (!episode) return { streams: [] };
+      const episodeData = {
+        ...episode,
+        stream_id: episode.id,
+        name: item.name || episode.title || episode.name || 'Série',
+        displayName: `${item.name || 'Série'} S${String(Number(seasonValue)).padStart(2, '0')} E${String(Number(episodeValue)).padStart(2, '0')}`,
+        episode: {
+          season: Number(seasonValue),
+          episode: Number(episodeValue)
+        }
+      };
+      const xtreamItem = xtreamEntry(
+        episodeData,
+        'series',
+        episode.container_extension || 'mp4'
+      );
+      let m3uItems = [];
+      try {
+        await ensurePlaylist();
+        m3uItems = await findRelatedEntriesByTitle(
+          'series',
+          item.name,
+          seasonValue,
+          episodeValue
+        );
+      } catch (error) {
+        console.warn(`[STREAM] M3U indisponível para episódio: ${error.message}`);
+      }
+      return { streams: streamsForEntries([xtreamItem, ...filterEntriesToSelectedQuality(m3uItems, xtreamItem)]) };
+    }
+    if (/^tt\d+(?::\d+:\d+)?$/i.test(String(id))) {
+      try {
+        const imdbDeadline = Date.now() + IMDB_STREAM_TIMEOUT_MS;
+        const remainingImdbMs = () => Math.max(0, imdbDeadline - Date.now());
+        const idMatch = String(id).match(/^tt\d+(?::(\d+):(\d+))?$/i);
+        const imdbId = String(id).match(/^(tt\d+)/i)?.[1];
+        const metadataTimeoutMs = Math.min(IMDB_METADATA_TIMEOUT_MS, remainingImdbMs());
+        const metadataPromise = withTimeout(findImdbResult(type, id), metadataTimeoutMs, undefined);
+        // A sugestão do IMDb costuma ter o título original mesmo quando o TMDB/Cinemeta
+        // devolve um título localizado ou não encontra o ID.
+        const imdbSuggestionPromise = imdbId
+          ? withTimeout(imdbSuggestionById(imdbId).catch(() => undefined), Math.min(6000, remainingImdbMs()), undefined)
+          : Promise.resolve(undefined);
+        let [result, imdbSuggestion] = await Promise.all([metadataPromise, imdbSuggestionPromise]);
+        if (imdbSuggestion?.title) {
+          result = result
+            ? {
+                ...result,
+                imdb_title: imdbSuggestion.title,
+                imdb_original_title: imdbSuggestion.original_title || imdbSuggestion.title,
+                imdb_year: imdbSuggestion.release_date || result.imdb_year
+              }
+            : {
+                title: imdbSuggestion.title,
+                name: imdbSuggestion.title,
+                original_title: imdbSuggestion.original_title || imdbSuggestion.title,
+                original_name: imdbSuggestion.original_name || imdbSuggestion.title,
+                imdb_title: imdbSuggestion.title,
+                imdb_original_title: imdbSuggestion.original_title || imdbSuggestion.title,
+                release_date: imdbSuggestion.release_date,
+                imdb_year: imdbSuggestion.release_date
+              };
+        }
+        sourceLog('imdb-title-resolution', {
+          id: imdbId || String(id),
+          metadataTitle: tmdbResultTitle(result) || '',
+          imdbTitle: imdbSuggestion?.title || '',
+          hasTmdbId: Boolean(Number(result?.id))
+        });
+        const xtreamTimeoutMs = Math.min(XTREAM_IMDB_TIMEOUT_MS, remainingImdbMs());
+        // PlayerFlix testa todos os players em paralelo; filmes também precisam
+        // de tempo suficiente para o embed responder antes do cancelamento.
+        const providerTimeoutMs = Math.min(22000, remainingImdbMs());
+        const providerController = new AbortController();
+        const emptyM3uMatch = { entry: undefined, entries: [] };
+        const findM3uFromCache = async (timeoutMs) => {
+          const deadline = Date.now() + timeoutMs;
+          const remaining = () => Math.max(0, deadline - Date.now());
+          const scan = async () => {
+            if (!result || !fs.existsSync(CACHE_FILE) || remaining() <= 0) return emptyM3uMatch;
+            return withTimeout(
+              findM3uMatchesForTmdb(type, result, idMatch?.[1], idMatch?.[2]),
+              remaining(),
+              emptyM3uMatch
+            );
+          };
+          try {
+            await withTimeout(ensurePlaylist(), remaining(), null);
+            let matched = await scan();
+            if (!matched?.entries?.length && cache.loading && remaining() > 0) {
+              await withTimeout(cache.loading, remaining(), null);
+              matched = await scan();
+            }
+            const entry = matched?.entry;
+            const entries = matched?.entries || [];
+            return { entry, entries };
+          } catch (error) {
+            console.warn(`[STREAM] M3U indisponível na busca IMDb: ${error.message}`);
+            return emptyM3uMatch;
+          }
+        };
+
+        // Consulta Xtream e provedores diretos primeiro; a playlist M3U só é lida
+        // quando nenhuma dessas fontes oferece um stream reproduzível.
+        const xtreamPromise = xtreamTimeoutMs > 0
+          ? findXtreamEntriesForImdb(type, id, result, xtreamTimeoutMs).catch((error) => {
+            console.warn(`[XTREAM] Busca IMDb falhou: ${error.message}`);
+            return [];
+          })
+          : Promise.resolve([]);
+        const providerPromise = providerTimeoutMs > 0
+          ? getDirectProviderApiStreams(type, id, result, idMatch, providerController.signal).catch((error) => {
+            console.warn('[MegaEmbed] Resolução direta indisponível.');
+            return [];
+          })
+          : Promise.resolve([]);
+        const [xtreamResult, providerResult] = await Promise.all([
+          xtreamTimeoutMs > 0 ? withTimeout(xtreamPromise, xtreamTimeoutMs, []) : Promise.resolve([]),
+          providerTimeoutMs > 0 ? withTimeout(providerPromise, providerTimeoutMs, null) : Promise.resolve([])
+        ]);
+        const xtreamEntries = xtreamResult || [];
+        const providerApiStreams = providerResult || [];
+        if (providerResult === null) providerController.abort();
+        const nonM3uStreams = combineStreams(providerApiStreams, streamsForEntries(xtreamEntries));
+        let m3uMatch = emptyM3uMatch;
+        let m3uAttempted = false;
+        if (shouldUseImdbM3uFallback(nonM3uStreams) && result && remainingImdbMs() > 0) {
+          const m3uBudgetMs = Math.min(IMDB_M3U_TIMEOUT_MS, remainingImdbMs());
+          if (m3uBudgetMs > 0) {
+            m3uAttempted = true;
+            m3uMatch = await findM3uFromCache(m3uBudgetMs);
+          }
+        }
+        const entry = m3uMatch.entry;
+        const m3uEntries = m3uMatch.entries || [];
+        const combinedStreams = nonM3uStreams.length
+          ? nonM3uStreams
+          : combineStreams(streamsForEntries(m3uEntries));
+        sourceLog('imdb-source-selection', {
+          xtreamEntries: xtreamEntries.length,
+          providerApiStreams: providerApiStreams.length,
+          m3uAttempted,
+          m3uEntries: m3uEntries.length
+        });
+        const streams = decorateImdbStreams(combinedStreams, type, id, result);
+        sourceLog('imdb-stream-result', {
+          type, id,
+          hasResult: Boolean(result), hasEntry: Boolean(entry),
+          providerApis: providerApiStreams.length,
+          xtream: xtreamEntries.length,
+          xtreamSources: [...new Set(xtreamEntries.map((item) => item.sourceName).filter(Boolean))],
+          m3u: m3uEntries.length,
+          combinedBeforeDedup: combinedStreams.length,
+          returned: streams.length
+        });
+        return { streams };
+      } catch (error) {
+        console.warn(`[STREAM] IMDb/TMDB indisponível: ${error.message}`);
+        return { streams: [] };
+      }
+    }
+
+    await ensurePlaylist();
+
+    if (type === 'movie') {
+      const entry =
+        await findEntry(id);
+      if (!entry) return { streams: [] };
+      const [xtreamEntries, direct, related] = await Promise.all([
+        findXtreamEntriesByTitle('movie', entry.title),
+        directMovieStreamsForTitle(entry.title),
+        findRelatedEntries('movie', entry)
+      ]);
+      const streams = combineStreams(
+        direct.streams,
+        streamsForEntries([
+          ...xtreamEntries,
+          ...(xtreamEntries.length || direct.streams.length ? [] : related)
+        ])
+      );
+      sourceLog('stream-result', {
+        source: 'combined',
+        type: 'movie',
+        id,
+        xtream: xtreamEntries.length,
+        m3u: related.length,
+        direct: direct.streams.length,
+        count: streams.length
+      });
+      return { streams };
+    }
+
+    if (type === 'tv') {
+      const entry =
+        await findEntry(id);
+      const xtreamEntries = entry
+        ? await findXtreamEntriesByTitle('tv', entry.title)
+        : [];
+      const selectedXtreamEntries = filterEntriesToSelectedQuality(xtreamEntries, entry);
+      const related = entry
+        ? filterEntriesToSelectedQuality(await findRelatedEntries('tv', entry), entry)
+        : [];
+
+      return {
+        streams: entry ? streamsForEntries(selectedXtreamEntries.length ? selectedXtreamEntries : related) : []
+      };
+    }
 
     const match =
       id.match(
